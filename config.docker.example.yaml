@@ -1,0 +1,49 @@
+# rsscord Docker config
+# Copy this to config.yaml, edit webhook_url + feeds, then run:
+#   mkdir -p data
+#   docker compose up -d --build
+
+discord:
+  webhook_url: "https://discord.com/api/webhooks/REPLACE_WITH_ID/REPLACE_WITH_TOKEN"
+  username: "rsscord"
+  avatar_url: null
+
+poll:
+  interval_seconds: 300
+  jitter_seconds: 15
+  timeout_seconds: 20
+  user_agent: "rsscord/0.1 (+local personal rss notifier)"
+
+state:
+  sqlite_path: "/data/rsscord_state.sqlite3"
+
+  # mark_seen: first run stores current feed items without notifying. safest default.
+  # notify_recent: first run notifies newest N items per feed.
+  # notify_all: first run notifies every current item. can spam.
+  first_run: "mark_seen"
+  recent_limit_per_feed: 5
+
+logging:
+  level: "INFO"
+  jsonl_path: "/data/rsscord.log.jsonl"
+
+notifications:
+  use_embeds: true
+  max_items_per_poll: 25
+  summary_max_chars: 500
+  content_template: "📰 {feed_name}: {title}\n{link}"
+
+discord_rate_limit:
+  max_retries: 4
+  base_backoff_seconds: 1.0
+
+feeds:
+  - name: "Hacker News frontpage"
+    url: "https://hnrss.org/frontpage"
+    enabled: true
+    tags: ["tech"]
+
+  - name: "xkcd"
+    url: "https://xkcd.com/atom.xml"
+    enabled: false
+    tags: ["comics"]

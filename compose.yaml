@@ -1,0 +1,8 @@
+services:
+  rsscord:
+    build: .
+    container_name: rsscord
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data

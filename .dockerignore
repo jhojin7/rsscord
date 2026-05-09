@@ -1,0 +1,10 @@
+.git
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+*.log.jsonl
+config.yaml
+data/
+.env
+.DS_Store
