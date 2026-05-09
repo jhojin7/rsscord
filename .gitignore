@@ -1,0 +1,6 @@
+.venv/
+*.sqlite3*
+config.yaml
+debug/
+files/
+rsscord.log.jsonl
