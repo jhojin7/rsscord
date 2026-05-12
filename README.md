@@ -1,28 +1,58 @@
+<!-- FILE: README.md -->
+
 # rsscord
 
-Small RSS/Atom feed notification system.
+Config-driven RSS-to-Discord notifications.
 
-## What this package contains
+`rsscord` watches RSS/Atom feeds, deduplicates items with local SQLite state, and posts new items to Discord webhooks.
 
-```text
-rsscord.py                  one-file Python app
-config.example.yaml          sample YAML config
-debug/assistant_trace.jsonl   safe implementation/tool-call trace, not hidden reasoning
-README.md                    this file
-```
+Current implementation:
 
-## Requirements
+* One Python file
+* YAML config
+* SQLite state
+* JSONL logs
+* `uv` local run
+* Docker deployment
 
-- Python 3.10+
-- `uv`
+> Status: early but usable. Best fit: personal feed monitoring, small Discord channels, self-hosted notification workflows.
 
-No env vars. Webhook URL, feed list, state path, logging path, and polling settings all live in YAML config.
+---
 
-## First run
+## Why rsscord
+
+Most RSS-to-Discord setups become heavier than they need to be.
+
+`rsscord` keeps the moving parts small:
+
+* **Config-first**: feed list and runtime behavior live in `config.yaml`.
+* **Local state**: SQLite prevents duplicate notifications.
+* **Safe first run**: default mode records existing items without flooding Discord.
+* **Debuggable**: JSONL logs are easy to inspect with normal shell tools.
+* **Self-hostable**: run with `uv` or Docker.
+
+---
+
+## Features
+
+* Poll multiple RSS/Atom feeds.
+* Send new items to a Discord webhook.
+* Use a global webhook or per-feed webhook override.
+* Render messages as Discord embeds or plain content.
+* Deduplicate items with SQLite.
+* Control first-run behavior with `mark_seen`, `notify_recent`, or `notify_all`.
+* Validate config before running.
+* Run once, dry-run, or long-running process mode.
+* Retry Discord rate limits using `retry_after` where available.
+* Keep structured JSONL runtime logs.
+
+---
+
+## Quickstart with uv
 
 ```bash
-unzip rsscord.zip
-cd rsscord_package
+git clone https://github.com/jhojin7/rsscord.git
+cd rsscord
 cp config.example.yaml config.yaml
 $EDITOR config.yaml
 uv run rsscord.py --config config.yaml --validate-config
@@ -30,125 +60,55 @@ uv run rsscord.py --config config.yaml --once --dry-run
 uv run rsscord.py --config config.yaml
 ```
 
-`uv` reads inline script metadata from `rsscord.py` and installs:
+---
 
-- `feedparser`
-- `httpx`
-- `PyYAML`
-
-## First-run behavior
-
-Default:
-
-```yaml
-state:
-  first_run: "mark_seen"
-```
-
-That means first run records current feed items as already seen and sends no Discord flood. After that, only new items notify.
-
-Other options:
-
-```yaml
-state:
-  first_run: "notify_recent"
-  recent_limit_per_feed: 5
-```
-
-or:
-
-```yaml
-state:
-  first_run: "notify_all"
-```
-
-## State
-
-Default state file:
-
-```yaml
-state:
-  sqlite_path: "./rsscord_state.sqlite3"
-```
-
-Delete this file to reset dedupe history.
-
-## Logs
-
-Default JSONL log file:
-
-```yaml
-logging:
-  jsonl_path: "./rsscord.log.jsonl"
-```
-
-Each line is standalone JSON. Useful for agent/debug workflows.
-
-## Discord webhook notes
-
-Webhook URL goes in config:
-
-```yaml
-discord:
-  webhook_url: "https://discord.com/api/webhooks/..."
-```
-
-Treat `config.yaml` as secret. Do not commit it to a public repo.
-
-## Per-feed webhook override
-
-```yaml
-feeds:
-  - name: "Important feed"
-    url: "https://example.com/rss.xml"
-    enabled: true
-    webhook_url: "https://discord.com/api/webhooks/OTHER/WEBHOOK"
-```
-
-## Run as simple foreground daemon
+## Quickstart with Docker
 
 ```bash
-uv run rsscord.py --config config.yaml
+git clone https://github.com/jhojin7/rsscord.git
+cd rsscord
+cp config.docker.example.yaml config.yaml
+$EDITOR config.yaml
+mkdir -p data
+docker compose up -d --build
 ```
 
-Stop with `Ctrl+C`.
-
-## Run once from cron/system scheduler
+Follow logs:
 
 ```bash
-uv run /path/to/rsscord.py --config /path/to/config.yaml --once
+docker compose logs -f rsscord
 ```
 
-## Notification template fields
+Stop:
 
-`notifications.content_template` supports:
-
-```text
-feed_name
-feed_title
-title
-link
-published
-author
-summary
-tags
+```bash
+docker compose down
 ```
 
-Example:
+---
 
-```yaml
-notifications:
-  content_template: |
-    New RSS item
-    Feed: {feed_name}
-    Title: {title}
-    URL: {link}
-```
+## Documentation
 
-## Failure model
+* [`docs/config.md`](docs/config.md): config reference and examples
+* [`docs/docker.md`](docs/docker.md): Docker setup and mounted paths
+* [`docs/operations.md`](docs/operations.md): runtime behavior, state, logs, failure model
+* [`docs/troubleshooting.md`](docs/troubleshooting.md): common issues
+* [`docs/roadmap.md`](docs/roadmap.md): planned work and agent-facing config ops
+* [`AGENTS.md`](AGENTS.md): rules for coding agents working on this repo
 
-- Feed fetch error: logged, next feed continues.
-- Discord 429: retries using `retry_after` when available.
-- Discord send failure: item stays unseen, so next poll retries.
-- Successful send: item gets marked seen in SQLite.
-- Dry run: sends nothing and does not mutate SQLite state.
+---
+
+## Non-goals
+
+Current non-goals:
+
+* No web UI.
+* No account system.
+* No hosted SaaS mode.
+* No direct FreshRSS integration yet.
+* No OPML import yet.
+* No unread/star/read-later state.
+* No database server.
+* No MCP server in the current implementation.
+
+FreshRSS integration, OPML import, and agent-safe config editing are possible future directions.
