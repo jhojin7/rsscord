@@ -1,4 +1,7 @@
 .venv/
+__pycache__/
+*.pyc
+*.egg-info/
 *.sqlite3*
 config.yaml
 debug/

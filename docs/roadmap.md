@@ -11,36 +11,39 @@ This document tracks likely future work. Items here are not implemented unless s
 * [ ] Add tests for first-run modes.
 * [ ] Add tests for Discord send failure behavior.
 * [ ] Add screenshot or GIF of Discord notification output.
-* [ ] Add release packaging for easier `uvx` use.
-* [ ] Add `AGENTS.md` to repo root.
+* [x] Add release packaging for easier `uvx` use.
+* [x] Add `AGENTS.md` to repo root.
 
 ---
 
 ## Agent-facing config operations
 
+Status: initial native CLI implemented.
+
 Goal: allow a local agent such as Hermes Agent to add, edit, disable, and remove feeds safely.
 
-Likely commands:
+Current commands:
 
 ```bash
-uv run rsscord.py config list-feeds --config config.yaml
-uv run rsscord.py config add-feed --config config.yaml --name "Example" --url "https://example.com/rss.xml" --tag example
-uv run rsscord.py config disable-feed --config config.yaml --name "Example"
-uv run rsscord.py config enable-feed --config config.yaml --name "Example"
-uv run rsscord.py config remove-feed --config config.yaml --name "Example"
-uv run rsscord.py config validate --config config.yaml
+rsscord config list-feeds --config config.yaml --json
+rsscord config add-feed --config config.yaml --json --dry-run --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config add-feed --config config.yaml --json --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config disable-feed --config config.yaml --json --name "Example"
+rsscord config enable-feed --config config.yaml --json --name "Example"
+rsscord config remove-feed --config config.yaml --json --name "Example"
+rsscord config validate --config config.yaml --json
 ```
 
-Design constraints:
+Implemented constraints:
 
-* Preserve comments when possible, or document that comments may be lost.
-* Always create timestamped config backup before mutation.
-* Never print Discord webhook tokens.
-* Validate feed URL shape before write.
-* Validate full config after write.
-* Prefer idempotent commands.
-* Support dry-run diff mode.
-* Keep human-readable YAML as source of truth.
+* Comments are not preserved; config writes use PyYAML serialization.
+* Mutations create timestamped config backups before writing.
+* Discord webhook values are redacted from JSON and diff output.
+* Feed URLs are validated before writing.
+* Full config is validated before and after writing.
+* Enable/disable/add exact duplicates are idempotent where possible.
+* Dry-run diff mode is supported.
+* Human-readable YAML remains the source of truth.
 
 Potential implementation options:
 
@@ -49,10 +52,10 @@ Potential implementation options:
 * `cli-anything` wrapper for rapid command scaffolding.
 * Later MCP server only if truly needed. Not part of current implementation.
 
-Recommended direction:
+Remaining direction:
 
-1. Start with native CLI subcommands.
-2. Add dry-run diff and backup.
+1. Add an update-feed command for renames, URL changes, and tag edits.
+2. Add OPML import/export once feed list management stabilizes.
 3. Let Hermes call CLI commands directly on same machine.
 4. Avoid MCP until there is a concrete need for remote tool discovery or richer protocol semantics.
 

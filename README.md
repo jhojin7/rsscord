@@ -43,6 +43,7 @@ Most RSS-to-Discord setups become heavier than they need to be.
 * Control first-run behavior with `mark_seen`, `notify_recent`, or `notify_all`.
 * Validate config before running.
 * Run once, dry-run, or long-running process mode.
+* Agent-safe config commands for Hermes/CLI-Anything style slash commands.
 * Retry Discord rate limits using `retry_after` where available.
 * Keep structured JSONL runtime logs.
 
@@ -58,6 +59,14 @@ $EDITOR config.yaml
 uv run rsscord.py --config config.yaml --validate-config
 uv run rsscord.py --config config.yaml --once --dry-run
 uv run rsscord.py --config config.yaml
+```
+
+Optional local install for the `rsscord` base command:
+
+```bash
+python -m pip install -e .
+rsscord validate --config config.yaml
+rsscord config list-feeds --config config.yaml --json
 ```
 
 ---

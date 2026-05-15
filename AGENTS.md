@@ -116,16 +116,17 @@ https://discord.com/api/webhooks/<redacted>/<redacted>
 
 ---
 
-## Planned config CLI
+## Agent config CLI
 
-Preferred future UX for Hermes Agent and similar local agents:
+Preferred UX for Hermes Agent and similar local agents:
 
 ```bash
-uv run rsscord.py config list-feeds --config config.yaml
-uv run rsscord.py config add-feed --config config.yaml --name "Example" --url "https://example.com/rss.xml" --tag example --dry-run
-uv run rsscord.py config add-feed --config config.yaml --name "Example" --url "https://example.com/rss.xml" --tag example
-uv run rsscord.py config disable-feed --config config.yaml --name "Example"
-uv run rsscord.py config remove-feed --config config.yaml --name "Example"
+rsscord config list-feeds --config config.yaml --json
+rsscord config add-feed --config config.yaml --json --dry-run --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config add-feed --config config.yaml --json --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config disable-feed --config config.yaml --json --name "Example"
+rsscord config enable-feed --config config.yaml --json --name "Example"
+rsscord config remove-feed --config config.yaml --json --name "Example"
 ```
 
 Required behavior for config-mutating commands:
@@ -136,6 +137,7 @@ Required behavior for config-mutating commands:
 * Validate full config after write.
 * Exit non-zero on validation failure.
 * Keep operation idempotent where possible.
+* Document that comments may be lost when YAML is rewritten.
 
 ---
 

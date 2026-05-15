@@ -38,6 +38,59 @@ Core loop:
 uv run rsscord.py --help
 ```
 
+After local install, the same commands are available through the `rsscord` base command:
+
+```bash
+python -m pip install -e .
+rsscord --help
+```
+
+### Agent commands
+
+These commands are designed for Hermes/CLI-Anything style slash-command bridges. Use
+`--json` for machine-readable output.
+
+```bash
+rsscord validate --config config.yaml --json
+rsscord config list-feeds --config config.yaml --json
+rsscord config add-feed --config config.yaml --json --dry-run --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config add-feed --config config.yaml --json --name "Example" --url "https://example.com/rss.xml" --tag example
+rsscord config disable-feed --config config.yaml --json --name "Example"
+rsscord config enable-feed --config config.yaml --json --name "Example"
+rsscord config remove-feed --config config.yaml --json --name "Example"
+rsscord poll once --config config.yaml --dry-run
+```
+
+Mutating config commands:
+
+* Create a timestamped backup in `ops/config-backups/` before writing.
+* Support `--dry-run`.
+* Print redacted unified diffs.
+* Validate the full config before and after writing.
+* Never print Discord webhook values.
+
+Config writes use PyYAML serialization, so comments in `config.yaml` are not preserved.
+
+### Public smoke test feed
+
+Use the OpenAI status RSS feed for a safe parser/fetch smoke test. Always run this
+with `--dry-run` unless you intentionally want Discord messages sent.
+
+```bash
+rsscord config add-feed --config config.yaml --json --dry-run --name "OpenAI Status" --url "https://status.openai.com/feed.rss" --tag status --tag openai
+rsscord config add-feed --config config.yaml --json --name "OpenAI Status" --url "https://status.openai.com/feed.rss" --tag status --tag openai
+rsscord poll once --config config.yaml --dry-run
+```
+
+Expected dry-run behavior:
+
+* `feed_checked` is logged for `OpenAI Status`.
+* `item_count` is greater than zero.
+* `notifications_sent` remains `0`.
+* No Discord webhook request is sent.
+
+### Legacy flags
+
 | Flag                     | Description                                                  |
 | ------------------------ | ------------------------------------------------------------ |
 | `--config PATH`          | YAML config path. Defaults to `config.yaml`.                 |

@@ -25,8 +25,10 @@ Design:
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime as dt
+import difflib
 import hashlib
 import html
 import json
@@ -40,6 +42,7 @@ import textwrap
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 import feedparser
 import httpx
@@ -313,12 +316,16 @@ def require_mapping(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-def load_config(path: Path) -> AppConfig:
+def load_raw_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
 
     with path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    return require_mapping(raw, "config")
+
+
+def parse_config(raw: dict[str, Any]) -> AppConfig:
     raw = require_mapping(raw, "config")
 
     discord_raw = require_mapping(raw.get("discord", {}), "discord")
@@ -403,6 +410,10 @@ def load_config(path: Path) -> AppConfig:
         discord_rate_limit=rate,
         feeds=feeds,
     )
+
+
+def load_config(path: Path) -> AppConfig:
+    return parse_config(load_raw_config(path))
 
 
 class StateStore:
@@ -861,17 +872,455 @@ class StopFlag:
         signal.signal(signal.SIGTERM, handler)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+DISCORD_WEBHOOK_RE = re.compile(
+    r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/[^\s\"']+",
+    re.IGNORECASE,
+)
+WEBHOOK_LINE_RE = re.compile(r"(?m)^([+\- ]?\s*webhook_url:\s*).*$")
+
+
+@dataclasses.dataclass
+class ConfigMutation:
+    operation: str
+    changed: bool
+    message: str
+    feed: dict[str, Any] | None = None
+
+
+def redact_secrets(value: str) -> str:
+    value = DISCORD_WEBHOOK_RE.sub(
+        "https://discord.com/api/webhooks/<redacted>/<redacted>",
+        value,
+    )
+    return WEBHOOK_LINE_RE.sub(lambda match: f'{match.group(1)}"<redacted>"', value)
+
+
+def dump_config_text(raw: dict[str, Any]) -> str:
+    return yaml.safe_dump(raw, sort_keys=False, allow_unicode=True, default_flow_style=False)
+
+
+def config_summary(config_path: Path, app_config: AppConfig) -> dict[str, Any]:
+    enabled_count = len([feed for feed in app_config.feeds if feed.enabled])
+    return {
+        "ok": True,
+        "config_path": str(config_path),
+        "feed_count": len(app_config.feeds),
+        "enabled_feed_count": enabled_count,
+        "state_path": str(app_config.state.sqlite_path),
+        "log_path": str(app_config.logging.jsonl_path),
+    }
+
+
+def feed_record(feed: FeedConfig) -> dict[str, Any]:
+    return {
+        "name": feed.name,
+        "url": feed.url,
+        "enabled": feed.enabled,
+        "tags": feed.tags,
+        "has_webhook_override": bool(feed.webhook_url),
+    }
+
+
+def raw_feed_record(feed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(feed.get("name") or ""),
+        "url": str(feed.get("url") or ""),
+        "enabled": bool(feed.get("enabled", True)),
+        "tags": coerce_list(feed.get("tags")),
+        "has_webhook_override": bool(feed.get("webhook_url")),
+    }
+
+
+def print_json(data: dict[str, Any]) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def emit_error(message: str, *, json_output: bool, code: int = 1) -> int:
+    if json_output:
+        print_json({"ok": False, "error": redact_secrets(message)})
+    else:
+        print(f"error: {redact_secrets(message)}", file=sys.stderr)
+    return code
+
+
+def print_feed_table(feeds: list[dict[str, Any]]) -> None:
+    if not feeds:
+        print("No feeds configured.")
+        return
+
+    rows = []
+    for index, feed in enumerate(feeds, start=1):
+        tags = ", ".join(feed["tags"]) if feed["tags"] else "-"
+        rows.append(
+            [
+                str(index),
+                "yes" if feed["enabled"] else "no",
+                feed["name"],
+                feed["url"],
+                tags,
+                "yes" if feed["has_webhook_override"] else "no",
+            ]
+        )
+    headers = ["#", "enabled", "name", "url", "tags", "webhook"]
+    widths = [
+        max(len(headers[column]), *(len(row[column]) for row in rows))
+        for column in range(len(headers))
+    ]
+    print("  ".join(headers[column].ljust(widths[column]) for column in range(len(headers))))
+    print("  ".join("-" * widths[column] for column in range(len(headers))))
+    for row in rows:
+        print("  ".join(row[column].ljust(widths[column]) for column in range(len(headers))))
+
+
+def validate_feed_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("feed URL must be an absolute http(s) URL")
+
+
+def validate_discord_webhook_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or "discord" not in parsed.netloc or not parsed.path.startswith("/api/webhooks/"):
+        raise ValueError("webhook URL must be a Discord webhook URL")
+
+
+def ensure_feeds_list(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    feeds = raw.get("feeds")
+    if feeds is None:
+        feeds = []
+        raw["feeds"] = feeds
+    if not isinstance(feeds, list):
+        raise ValueError("feeds must be a YAML list")
+    for index, feed in enumerate(feeds):
+        require_mapping(feed, f"feeds[{index}]")
+    return feeds
+
+
+def find_feed_index(feeds: list[dict[str, Any]], name: str) -> int | None:
+    exact_matches = [index for index, feed in enumerate(feeds) if str(feed.get("name") or "") == name]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        raise ValueError(f"multiple feeds named {name!r}; fix config before mutating")
+
+    folded = name.casefold()
+    folded_matches = [
+        index for index, feed in enumerate(feeds) if str(feed.get("name") or "").casefold() == folded
+    ]
+    if len(folded_matches) == 1:
+        return folded_matches[0]
+    if len(folded_matches) > 1:
+        raise ValueError(f"multiple feeds match {name!r}; use exact casing after fixing config")
+    return None
+
+
+def config_diff(before_text: str, after_text: str, config_path: Path) -> list[str]:
+    before_lines = before_text.splitlines(keepends=True)
+    after_lines = after_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        before_lines,
+        after_lines,
+        fromfile=str(config_path),
+        tofile=f"{config_path} (updated)",
+        lineterm="",
+    )
+    return [redact_secrets(line.rstrip("\n")) for line in diff]
+
+
+def create_config_backup(config_path: Path, before_text: str) -> Path:
+    backup_dir = config_path.parent / "ops" / "config-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = config_path.suffix or ".yaml"
+    base = f"{config_path.stem}.{timestamp}{suffix}"
+    backup_path = backup_dir / base
+    counter = 1
+    while backup_path.exists():
+        backup_path = backup_dir / f"{config_path.stem}.{timestamp}.{counter}{suffix}"
+        counter += 1
+    backup_path.write_text(before_text, encoding="utf-8")
+    return backup_path
+
+
+def emit_mutation_result(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print_json(payload)
+        return
+
+    print(payload["message"])
+    if payload.get("dry_run"):
+        print("dry_run: no file written")
+    if payload.get("backup_path"):
+        print(f"backup: {payload['backup_path']}")
+    diff_lines = payload.get("diff") or []
+    if diff_lines:
+        print("\n".join(diff_lines))
+
+
+def run_config_mutation(args: argparse.Namespace, mutator: Any) -> int:
+    config_path = args.config
+    before_text = config_path.read_text(encoding="utf-8")
+    raw = load_raw_config(config_path)
+    candidate = copy.deepcopy(raw)
+    mutation = mutator(candidate, args)
+    parse_config(candidate)
+
+    after_text = dump_config_text(candidate)
+    diff_lines = config_diff(before_text, after_text, config_path) if mutation.changed else []
+    backup_path = None
+    if mutation.changed and not args.dry_run:
+        backup_path = create_config_backup(config_path, before_text)
+        config_path.write_text(after_text, encoding="utf-8")
+        load_config(config_path)
+
+    payload = {
+        "ok": True,
+        "operation": mutation.operation,
+        "changed": mutation.changed,
+        "dry_run": bool(args.dry_run),
+        "config_path": str(config_path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "message": mutation.message,
+        "feed": mutation.feed,
+        "diff": diff_lines,
+    }
+    emit_mutation_result(payload, json_output=args.json_output)
+    return 0
+
+
+def mutate_add_feed(raw: dict[str, Any], args: argparse.Namespace) -> ConfigMutation:
+    name = str(args.name or "").strip()
+    url = str(args.url or "").strip()
+    tags = [str(tag).strip() for tag in (args.tag or []) if str(tag).strip()]
+    webhook_url = str(args.webhook_url or "").strip()
+    enabled = not args.disabled
+
+    if not name:
+        raise ValueError("feed name is required")
+    validate_feed_url(url)
+    if webhook_url:
+        validate_discord_webhook_url(webhook_url)
+
+    feeds = ensure_feeds_list(raw)
+    existing_index = find_feed_index(feeds, name)
+    new_feed: dict[str, Any] = {"name": name, "url": url, "enabled": enabled, "tags": tags}
+    if webhook_url:
+        new_feed["webhook_url"] = webhook_url
+
+    if existing_index is not None:
+        existing = feeds[existing_index]
+        existing_webhook = str(existing.get("webhook_url") or "").strip()
+        if raw_feed_record(existing) == raw_feed_record(new_feed) and existing_webhook == webhook_url:
+            return ConfigMutation("config.add-feed", False, f"feed already exists: {name}", raw_feed_record(existing))
+        raise ValueError(f"feed already exists with different settings: {name}")
+
+    for feed in feeds:
+        if str(feed.get("url") or "").strip() == url:
+            raise ValueError("another feed already uses this URL")
+
+    feeds.append(new_feed)
+    return ConfigMutation("config.add-feed", True, f"added feed: {name}", raw_feed_record(new_feed))
+
+
+def mutate_set_feed_enabled(raw: dict[str, Any], args: argparse.Namespace, *, enabled: bool) -> ConfigMutation:
+    name = str(args.name or "").strip()
+    feeds = ensure_feeds_list(raw)
+    index = find_feed_index(feeds, name)
+    if index is None:
+        raise ValueError(f"feed not found: {name}")
+    feed = feeds[index]
+    if bool(feed.get("enabled", True)) == enabled:
+        state = "enabled" if enabled else "disabled"
+        return ConfigMutation(f"config.{state}-feed", False, f"feed already {state}: {name}", raw_feed_record(feed))
+    feed["enabled"] = enabled
+    state = "enabled" if enabled else "disabled"
+    return ConfigMutation(f"config.{state}-feed", True, f"{state} feed: {name}", raw_feed_record(feed))
+
+
+def mutate_remove_feed(raw: dict[str, Any], args: argparse.Namespace) -> ConfigMutation:
+    name = str(args.name or "").strip()
+    feeds = ensure_feeds_list(raw)
+    index = find_feed_index(feeds, name)
+    if index is None:
+        raise ValueError(f"feed not found: {name}")
+    removed = feeds.pop(index)
+    return ConfigMutation("config.remove-feed", True, f"removed feed: {name}", raw_feed_record(removed))
+
+
+def command_example_config(_args: argparse.Namespace) -> int:
+    print(EXAMPLE_CONFIG)
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    app_config = load_config(args.config)
+    payload = config_summary(args.config, app_config)
+    if args.json_output:
+        print_json(payload)
+    else:
+        print(f"config valid: {args.config}")
+        print(f"feeds: {payload['feed_count']} total, {payload['enabled_feed_count']} enabled")
+        print(f"state: {payload['state_path']}")
+        print(f"logs: {payload['log_path']}")
+    return 0
+
+
+def command_list_feeds(args: argparse.Namespace) -> int:
+    app_config = load_config(args.config)
+    feeds = [feed_record(feed) for feed in app_config.feeds]
+    payload = {"ok": True, "config_path": str(args.config), "feeds": feeds}
+    if args.json_output:
+        print_json(payload)
+    else:
+        print_feed_table(feeds)
+    return 0
+
+
+def command_add_feed(args: argparse.Namespace) -> int:
+    return run_config_mutation(args, mutate_add_feed)
+
+
+def command_enable_feed(args: argparse.Namespace) -> int:
+    return run_config_mutation(args, lambda raw, ns: mutate_set_feed_enabled(raw, ns, enabled=True))
+
+
+def command_disable_feed(args: argparse.Namespace) -> int:
+    return run_config_mutation(args, lambda raw, ns: mutate_set_feed_enabled(raw, ns, enabled=False))
+
+
+def command_remove_feed(args: argparse.Namespace) -> int:
+    return run_config_mutation(args, mutate_remove_feed)
+
+
+def command_poll_once(args: argparse.Namespace) -> int:
+    app_config = load_config(args.config)
+    logger = JsonlLogger(app_config.logging.jsonl_path, app_config.logging.level)
+    state = StateStore(app_config.state.sqlite_path)
+    try:
+        poll_once(app_config, state, logger, dry_run=args.dry_run)
+        return 0
+    finally:
+        state.close()
+
+
+def run_daemon(
+    app_config: AppConfig,
+    logger: JsonlLogger,
+    state: StateStore,
+    stop: StopFlag,
+    *,
+    dry_run: bool = False,
+) -> int:
+    logger.info(
+        "daemon_started",
+        interval_seconds=app_config.poll.interval_seconds,
+        jitter_seconds=app_config.poll.jitter_seconds,
+        feed_count=len(app_config.feeds),
+    )
+    while not stop.stop:
+        poll_once(app_config, state, logger, dry_run=dry_run)
+        jitter = random.uniform(0, app_config.poll.jitter_seconds) if app_config.poll.jitter_seconds else 0
+        sleep_seconds = app_config.poll.interval_seconds + jitter
+        logger.info("sleeping", seconds=round(sleep_seconds, 3))
+        deadline = time.monotonic() + sleep_seconds
+        while not stop.stop and time.monotonic() < deadline:
+            time.sleep(min(1.0, deadline - time.monotonic()))
+
+    logger.info("daemon_stopped")
+    return 0
+
+
+def command_poll_daemon(args: argparse.Namespace) -> int:
+    app_config = load_config(args.config)
+    logger = JsonlLogger(app_config.logging.jsonl_path, app_config.logging.level)
+    state = StateStore(app_config.state.sqlite_path)
+    stop = StopFlag()
+    stop.install(logger)
+    try:
+        return run_daemon(app_config, logger, state, stop, dry_run=args.dry_run)
+    finally:
+        state.close()
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="YAML config path")
+    parser.add_argument("--json", dest="json_output", action="store_true", default=argparse.SUPPRESS, help="print JSON output")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="RSS/Atom -> Discord webhook notifier. YAML config. SQLite state. JSONL logs."
     )
     parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="YAML config path")
-    parser.add_argument("--once", action="store_true", help="poll once and exit")
-    parser.add_argument("--dry-run", action="store_true", help="do not send Discord messages")
-    parser.add_argument("--print-example-config", action="store_true", help="print sample YAML config")
-    parser.add_argument("--validate-config", action="store_true", help="load config and exit")
-    args = parser.parse_args(argv)
+    parser.add_argument("--json", dest="json_output", action="store_true", help="print JSON output for agent commands")
+    parser.add_argument("--once", action="store_true", help="legacy: poll once and exit")
+    parser.add_argument("--dry-run", action="store_true", help="legacy: do not send Discord messages")
+    parser.add_argument("--print-example-config", action="store_true", help="legacy: print sample YAML config")
+    parser.add_argument("--validate-config", action="store_true", help="legacy: load config and exit")
 
+    subparsers = parser.add_subparsers(dest="command")
+
+    example_parser = subparsers.add_parser("example-config", help="print sample YAML config")
+    example_parser.set_defaults(handler=command_example_config)
+
+    validate_parser = subparsers.add_parser("validate", help="validate config and print a summary")
+    add_common_args(validate_parser)
+    validate_parser.set_defaults(handler=command_validate)
+
+    poll_parser = subparsers.add_parser("poll", help="poll feeds or run the daemon")
+    poll_subparsers = poll_parser.add_subparsers(dest="poll_command", required=True)
+    poll_once_parser = poll_subparsers.add_parser("once", help="poll once and exit")
+    add_common_args(poll_once_parser)
+    poll_once_parser.add_argument("--dry-run", action="store_true", help="do not send Discord messages")
+    poll_once_parser.set_defaults(handler=command_poll_once)
+    poll_daemon_parser = poll_subparsers.add_parser("daemon", help="run the long-lived poller")
+    add_common_args(poll_daemon_parser)
+    poll_daemon_parser.add_argument("--dry-run", action="store_true", help="do not send Discord messages")
+    poll_daemon_parser.set_defaults(handler=command_poll_daemon)
+
+    config_parser = subparsers.add_parser("config", help="agent-safe YAML config operations")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+
+    config_validate_parser = config_subparsers.add_parser("validate", help="validate config and print a summary")
+    add_common_args(config_validate_parser)
+    config_validate_parser.set_defaults(handler=command_validate)
+
+    list_feeds_parser = config_subparsers.add_parser("list-feeds", help="list configured feeds")
+    add_common_args(list_feeds_parser)
+    list_feeds_parser.set_defaults(handler=command_list_feeds)
+
+    add_feed_parser = config_subparsers.add_parser("add-feed", help="add an RSS/Atom feed")
+    add_common_args(add_feed_parser)
+    add_feed_parser.add_argument("--name", required=True, help="feed display name")
+    add_feed_parser.add_argument("--url", required=True, help="RSS/Atom feed URL")
+    add_feed_parser.add_argument("--tag", action="append", default=[], help="feed tag; repeat for multiple tags")
+    add_feed_parser.add_argument("--webhook-url", help="optional per-feed Discord webhook override")
+    add_feed_parser.add_argument("--disabled", action="store_true", help="add feed disabled")
+    add_feed_parser.add_argument("--dry-run", action="store_true", help="show redacted diff without writing")
+    add_feed_parser.set_defaults(handler=command_add_feed)
+
+    enable_feed_parser = config_subparsers.add_parser("enable-feed", help="enable a feed by name")
+    add_common_args(enable_feed_parser)
+    enable_feed_parser.add_argument("--name", required=True, help="feed display name")
+    enable_feed_parser.add_argument("--dry-run", action="store_true", help="show redacted diff without writing")
+    enable_feed_parser.set_defaults(handler=command_enable_feed)
+
+    disable_feed_parser = config_subparsers.add_parser("disable-feed", help="disable a feed by name")
+    add_common_args(disable_feed_parser)
+    disable_feed_parser.add_argument("--name", required=True, help="feed display name")
+    disable_feed_parser.add_argument("--dry-run", action="store_true", help="show redacted diff without writing")
+    disable_feed_parser.set_defaults(handler=command_disable_feed)
+
+    remove_feed_parser = config_subparsers.add_parser("remove-feed", help="remove a feed by name")
+    add_common_args(remove_feed_parser)
+    remove_feed_parser.add_argument("--name", required=True, help="feed display name")
+    remove_feed_parser.add_argument("--dry-run", action="store_true", help="show redacted diff without writing")
+    remove_feed_parser.set_defaults(handler=command_remove_feed)
+
+    return parser
+
+
+def run_legacy(args: argparse.Namespace) -> int:
     if args.print_example_config:
         print(EXAMPLE_CONFIG)
         return 0
@@ -879,8 +1328,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         app_config = load_config(args.config)
     except Exception as exc:
-        print(f"config_error: {exc}", file=sys.stderr)
-        return 2
+        return emit_error(f"config_error: {exc}", json_output=args.json_output, code=2)
+
+    if args.validate_config and args.json_output:
+        print_json(config_summary(args.config, app_config))
+        return 0
 
     logger = JsonlLogger(app_config.logging.jsonl_path, app_config.logging.level)
 
@@ -903,25 +1355,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             poll_once(app_config, state, logger, dry_run=args.dry_run)
             return 0
 
-        logger.info(
-            "daemon_started",
-            interval_seconds=app_config.poll.interval_seconds,
-            jitter_seconds=app_config.poll.jitter_seconds,
-            feed_count=len(app_config.feeds),
-        )
-        while not stop.stop:
-            poll_once(app_config, state, logger, dry_run=args.dry_run)
-            jitter = random.uniform(0, app_config.poll.jitter_seconds) if app_config.poll.jitter_seconds else 0
-            sleep_seconds = app_config.poll.interval_seconds + jitter
-            logger.info("sleeping", seconds=round(sleep_seconds, 3))
-            deadline = time.monotonic() + sleep_seconds
-            while not stop.stop and time.monotonic() < deadline:
-                time.sleep(min(1.0, deadline - time.monotonic()))
-
-        logger.info("daemon_stopped")
-        return 0
+        return run_daemon(app_config, logger, state, stop, dry_run=args.dry_run)
     finally:
         state.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "json_output"):
+        args.json_output = False
+    if not hasattr(args, "config"):
+        args.config = Path("config.yaml")
+
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        return run_legacy(args)
+
+    try:
+        return handler(args)
+    except Exception as exc:
+        return emit_error(str(exc), json_output=args.json_output)
 
 
 if __name__ == "__main__":
